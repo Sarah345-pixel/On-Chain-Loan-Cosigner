@@ -12,6 +12,9 @@
 (define-constant ERR_ALREADY_DEFAULTED (err u110))
 (define-constant ERR_INVALID_DURATION (err u111))
 (define-constant ERR_INVALID_INTEREST (err u112))
+(define-constant ERR_INSUFFICIENT_COLLATERAL (err u113))
+(define-constant ERR_COLLATERAL_LOCKED (err u114))
+(define-constant ERR_LIQUIDATION_THRESHOLD_NOT_MET (err u115))
 
 (define-data-var loan-counter uint u0)
 
@@ -25,7 +28,9 @@
     funded-at: (optional uint),
     repaid-amount: uint,
     status: (string-ascii 20),
-    last-payment: (optional uint)
+    last-payment: (optional uint),
+    collateral-amount: uint,
+    collateral-ratio: uint
 })
 
 (define-map loan-payments uint {
@@ -48,6 +53,12 @@
     defaults: uint
 })
 
+(define-map loan-collateral uint {
+    deposited-amount: uint,
+    liquidation-threshold: uint,
+    is-locked: bool
+})
+
 (define-read-only (get-loan (loan-id uint))
     (map-get? loans loan-id))
 
@@ -60,6 +71,20 @@
 (define-read-only (get-user-stats (user principal))
     (default-to {loans-created: u0, loans-cosigned: u0, total-borrowed: u0, total-cosigned: u0, defaults: u0}
                 (map-get? user-stats user)))
+
+(define-read-only (get-loan-collateral (loan-id uint))
+    (map-get? loan-collateral loan-id))
+
+(define-read-only (calculate-collateral-ratio (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (match (map-get? loan-collateral loan-id)
+            collateral-data
+            (if (> (get amount loan-data) u0)
+                (ok (/ (* (get deposited-amount collateral-data) u100) (get amount loan-data)))
+                (ok u0))
+            (ok u0))
+        ERR_LOAN_NOT_FOUND))
 
 (define-read-only (calculate-monthly-payment (amount uint) (interest-rate uint) (duration-blocks uint))
     (let ((monthly-interest (/ interest-rate u12))
@@ -86,10 +111,10 @@
     (let ((current-stats (get-user-stats user)))
         (map-set user-stats user
             (if (is-eq field "loans-created")
-                (merge current-stats {loans-created: (+ (get loans-created current-stats) u1)
+                (merge current-stats {loans-created: (+ (get loans-created current-stats) u1),
                                     total-borrowed: (+ (get total-borrowed current-stats) amount)})
                 (if (is-eq field "loans-cosigned")
-                    (merge current-stats {loans-cosigned: (+ (get loans-cosigned current-stats) u1)
+                    (merge current-stats {loans-cosigned: (+ (get loans-cosigned current-stats) u1),
                                         total-cosigned: (+ (get total-cosigned current-stats) amount)})
                     (if (is-eq field "defaults")
                         (merge current-stats {defaults: (+ (get defaults current-stats) u1)})
@@ -110,7 +135,9 @@
             funded-at: none,
             repaid-amount: u0,
             status: "pending",
-            last-payment: none
+            last-payment: none,
+            collateral-amount: u0,
+            collateral-ratio: u0
         })
         (update-user-stats tx-sender "loans-created" amount)
         (var-set loan-counter loan-id)
@@ -216,6 +243,69 @@
             (ok true))
         ERR_LOAN_NOT_FOUND))
 
+(define-public (deposit-collateral (loan-id uint) (collateral-amount uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (asserts! (or (is-eq (get status loan-data) "pending") (is-eq (get status loan-data) "active")) ERR_LOAN_NOT_ACTIVE)
+            (asserts! (> collateral-amount u0) ERR_INVALID_AMOUNT)
+            (try! (stx-transfer? collateral-amount tx-sender (as-contract tx-sender)))
+            (let ((current-collateral (default-to {deposited-amount: u0, liquidation-threshold: u150, is-locked: false}
+                                                 (map-get? loan-collateral loan-id)))
+                  (new-total-collateral (+ (get deposited-amount current-collateral) collateral-amount))
+                  (new-ratio (/ (* new-total-collateral u100) (get amount loan-data))))
+                (map-set loan-collateral loan-id
+                    (merge current-collateral {deposited-amount: new-total-collateral}))
+                (map-set loans loan-id
+                    (merge loan-data {collateral-amount: new-total-collateral, collateral-ratio: new-ratio}))
+                (ok true)))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (withdraw-collateral (loan-id uint) (withdrawal-amount uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (asserts! (or (is-eq (get status loan-data) "completed") (is-eq (get status loan-data) "pending")) ERR_COLLATERAL_LOCKED)
+            (let ((collateral-info (default-to {deposited-amount: u0, liquidation-threshold: u150, is-locked: false}
+                                              (map-get? loan-collateral loan-id))))
+                (asserts! (>= (get deposited-amount collateral-info) withdrawal-amount) ERR_INSUFFICIENT_COLLATERAL)
+                (asserts! (not (get is-locked collateral-info)) ERR_COLLATERAL_LOCKED)
+                (let ((new-collateral-amount (- (get deposited-amount collateral-info) withdrawal-amount))
+                      (new-ratio (if (> (get amount loan-data) u0)
+                                   (/ (* new-collateral-amount u100) (get amount loan-data))
+                                   u0)))
+                    (map-set loan-collateral loan-id
+                        (merge collateral-info {deposited-amount: new-collateral-amount}))
+                    (map-set loans loan-id
+                        (merge loan-data {collateral-amount: new-collateral-amount, collateral-ratio: new-ratio}))
+                    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender (get borrower loan-data))))
+                    (ok true))))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (liquidate-collateral (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (or (is-eq tx-sender (get borrower loan-data))
+                         (is-eq (some tx-sender) (get cosigner loan-data))) ERR_UNAUTHORIZED)
+            (asserts! (is-eq (get status loan-data) "defaulted") ERR_LOAN_NOT_ACTIVE)
+            (let ((collateral-info (default-to {deposited-amount: u0, liquidation-threshold: u150, is-locked: false}
+                                              (map-get? loan-collateral loan-id)))
+                  (current-ratio (unwrap! (calculate-collateral-ratio loan-id) ERR_LOAN_NOT_FOUND)))
+                (asserts! (< current-ratio (get liquidation-threshold collateral-info)) ERR_LIQUIDATION_THRESHOLD_NOT_MET)
+                (let ((liquidation-amount (get deposited-amount collateral-info)))
+                    (map-set loan-collateral loan-id
+                        (merge collateral-info {deposited-amount: u0, is-locked: false}))
+                    (map-set loans loan-id
+                        (merge loan-data {collateral-amount: u0, collateral-ratio: u0}))
+                    (match (get cosigner loan-data)
+                        cosigner-principal (try! (as-contract (stx-transfer? liquidation-amount tx-sender cosigner-principal)))
+                        (try! (as-contract (stx-transfer? liquidation-amount tx-sender CONTRACT_OWNER))))
+                    (ok liquidation-amount))))
+        ERR_LOAN_NOT_FOUND))
+
 (define-public (emergency-withdraw (amount uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
@@ -232,11 +322,13 @@
     (match (map-get? loans loan-id)
         loan-data
         (let ((payment-info (map-get? loan-payments loan-id))
+              (collateral-info (map-get? loan-collateral loan-id))
               (total-due (+ (get amount loan-data) 
                            (/ (* (get amount loan-data) (get interest-rate loan-data)) u100))))
             (ok {
                 loan: loan-data,
                 payment-info: payment-info,
+                collateral-info: collateral-info,
                 total-due: total-due,
                 remaining-balance: (- total-due (get repaid-amount loan-data)),
                 is-overdue: (is-loan-overdue loan-id)

@@ -15,6 +15,16 @@
 (define-constant ERR_INSUFFICIENT_COLLATERAL (err u113))
 (define-constant ERR_COLLATERAL_LOCKED (err u114))
 (define-constant ERR_LIQUIDATION_THRESHOLD_NOT_MET (err u115))
+(define-constant ERR_BID_NOT_FOUND (err u116))
+(define-constant ERR_BID_ALREADY_EXISTS (err u117))
+(define-constant ERR_BID_AMOUNT_MISMATCH (err u118))
+(define-constant ERR_MARKETPLACE_CLOSED (err u119))
+(define-constant ERR_INVALID_BID_RATE (err u120))
+(define-constant ERR_TRANSFER_NOT_FOUND (err u121))
+(define-constant ERR_TRANSFER_ALREADY_EXISTS (err u122))
+(define-constant ERR_TRANSFER_TO_SELF (err u123))
+(define-constant ERR_TRANSFER_ALREADY_APPROVED (err u124))
+(define-constant ERR_INVALID_TRANSFER_AMOUNT (err u125))
 
 (define-data-var loan-counter uint u0)
 
@@ -59,6 +69,29 @@
     is-locked: bool
 })
 
+(define-map loan-bids {loan-id: uint, lender: principal} {
+    interest-rate: uint,
+    amount: uint,
+    expires-at: uint,
+    is-active: bool
+})
+
+(define-map loan-marketplace uint {
+    is-open: bool,
+    best-bid-rate: uint,
+    best-bidder: (optional principal),
+    bid-count: uint,
+    expires-at: uint
+})
+
+(define-map loan-transfers {loan-id: uint, from-party: principal, to-party: principal} {
+    transfer-amount: uint,
+    transfer-fee: uint,
+    approved: bool,
+    created-at: uint,
+    expires-at: uint
+})
+
 (define-read-only (get-loan (loan-id uint))
     (map-get? loans loan-id))
 
@@ -74,6 +107,15 @@
 
 (define-read-only (get-loan-collateral (loan-id uint))
     (map-get? loan-collateral loan-id))
+
+(define-read-only (get-loan-bid (loan-id uint) (lender principal))
+    (map-get? loan-bids {loan-id: loan-id, lender: lender}))
+
+(define-read-only (get-loan-marketplace (loan-id uint))
+    (map-get? loan-marketplace loan-id))
+
+(define-read-only (get-loan-transfer (loan-id uint) (from-party principal) (to-party principal))
+    (map-get? loan-transfers {loan-id: loan-id, from-party: from-party, to-party: to-party}))
 
 (define-read-only (calculate-collateral-ratio (loan-id uint))
     (match (map-get? loans loan-id)
@@ -141,6 +183,13 @@
         })
         (update-user-stats tx-sender "loans-created" amount)
         (var-set loan-counter loan-id)
+        (map-set loan-marketplace loan-id {
+            is-open: true,
+            best-bid-rate: interest-rate,
+            best-bidder: none,
+            bid-count: u0,
+            expires-at: (+ stacks-block-height u1008)
+        })
         (ok loan-id)))
 
 (define-public (request-cosigner (loan-id uint) (cosigner principal))
@@ -306,11 +355,177 @@
                     (ok liquidation-amount))))
         ERR_LOAN_NOT_FOUND))
 
+(define-public (place-bid (loan-id uint) (bid-interest-rate uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get status loan-data) "pending") ERR_LOAN_NOT_PENDING)
+            (asserts! (<= bid-interest-rate u50) ERR_INVALID_BID_RATE)
+            (asserts! (> bid-interest-rate u0) ERR_INVALID_BID_RATE)
+            (let ((marketplace-data (default-to {is-open: false, best-bid-rate: u0, best-bidder: none, bid-count: u0, expires-at: u0}
+                                               (map-get? loan-marketplace loan-id)))
+                  (existing-bid (map-get? loan-bids {loan-id: loan-id, lender: tx-sender})))
+                (asserts! (get is-open marketplace-data) ERR_MARKETPLACE_CLOSED)
+                (asserts! (< stacks-block-height (get expires-at marketplace-data)) ERR_MARKETPLACE_CLOSED)
+                (asserts! (is-none existing-bid) ERR_BID_ALREADY_EXISTS)
+                (asserts! (< bid-interest-rate (get best-bid-rate marketplace-data)) ERR_INVALID_BID_RATE)
+                (map-set loan-bids {loan-id: loan-id, lender: tx-sender} {
+                    interest-rate: bid-interest-rate,
+                    amount: (get amount loan-data),
+                    expires-at: (+ stacks-block-height u5040),
+                    is-active: true
+                })
+                (map-set loan-marketplace loan-id
+                    (merge marketplace-data {
+                        best-bid-rate: bid-interest-rate,
+                        best-bidder: (some tx-sender),
+                        bid-count: (+ (get bid-count marketplace-data) u1)
+                    }))
+                (ok true)))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (accept-bid (loan-id uint) (lender principal))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (asserts! (is-eq (get status loan-data) "pending") ERR_LOAN_NOT_PENDING)
+            (let ((bid-data (unwrap! (map-get? loan-bids {loan-id: loan-id, lender: lender}) ERR_BID_NOT_FOUND))
+                  (marketplace-data (unwrap! (map-get? loan-marketplace loan-id) ERR_LOAN_NOT_FOUND)))
+                (asserts! (get is-active bid-data) ERR_BID_NOT_FOUND)
+                (asserts! (< stacks-block-height (get expires-at bid-data)) ERR_BID_NOT_FOUND)
+                (asserts! (is-eq (get amount bid-data) (get amount loan-data)) ERR_BID_AMOUNT_MISMATCH)
+                (map-set loans loan-id
+                    (merge loan-data {
+                        interest-rate: (get interest-rate bid-data),
+                        cosigner: (some lender),
+                        status: "approved"
+                    }))
+                (map-set loan-marketplace loan-id
+                    (merge marketplace-data {is-open: false}))
+                (update-user-stats lender "loans-cosigned" (get amount loan-data))
+                (ok true)))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (withdraw-bid (loan-id uint))
+    (let ((bid-data (unwrap! (map-get? loan-bids {loan-id: loan-id, lender: tx-sender}) ERR_BID_NOT_FOUND)))
+        (asserts! (get is-active bid-data) ERR_BID_NOT_FOUND)
+        (map-set loan-bids {loan-id: loan-id, lender: tx-sender}
+            (merge bid-data {is-active: false}))
+        (match (map-get? loan-marketplace loan-id)
+            marketplace-data
+            (if (is-eq (some tx-sender) (get best-bidder marketplace-data))
+                (map-set loan-marketplace loan-id
+                    (merge marketplace-data {
+                        best-bidder: none,
+                        best-bid-rate: u50,
+                        bid-count: (if (> (get bid-count marketplace-data) u0)
+                                     (- (get bid-count marketplace-data) u1)
+                                     u0)
+                    }))
+                true)
+            true)
+        (ok true)))
+
+(define-public (close-marketplace (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (match (map-get? loan-marketplace loan-id)
+                marketplace-data
+                (begin
+                    (map-set loan-marketplace loan-id
+                        (merge marketplace-data {is-open: false}))
+                    (ok true))
+                ERR_LOAN_NOT_FOUND))
+        ERR_LOAN_NOT_FOUND))
+
 (define-public (emergency-withdraw (amount uint))
     (begin
         (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
         (try! (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER)))
         (ok true)))
+
+(define-public (initiate-loan-transfer (loan-id uint) (to-party principal) (transfer-amount uint) (transfer-fee uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (not (is-eq tx-sender to-party)) ERR_TRANSFER_TO_SELF)
+            (asserts! (is-eq (some tx-sender) (get cosigner loan-data)) ERR_UNAUTHORIZED)
+            (asserts! (or (is-eq (get status loan-data) "active") (is-eq (get status loan-data) "approved")) ERR_LOAN_NOT_ACTIVE)
+            (asserts! (> transfer-amount u0) ERR_INVALID_TRANSFER_AMOUNT)
+            (asserts! (is-none (map-get? loan-transfers {loan-id: loan-id, from-party: tx-sender, to-party: to-party})) ERR_TRANSFER_ALREADY_EXISTS)
+            (map-set loan-transfers {loan-id: loan-id, from-party: tx-sender, to-party: to-party} {
+                transfer-amount: transfer-amount,
+                transfer-fee: transfer-fee,
+                approved: false,
+                created-at: stacks-block-height,
+                expires-at: (+ stacks-block-height u1008)
+            })
+            (ok true))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (approve-loan-transfer (loan-id uint) (from-party principal))
+    (let ((transfer-key {loan-id: loan-id, from-party: from-party, to-party: tx-sender}))
+        (match (map-get? loan-transfers transfer-key)
+            transfer-data
+            (begin
+                (asserts! (not (get approved transfer-data)) ERR_TRANSFER_ALREADY_APPROVED)
+                (asserts! (< stacks-block-height (get expires-at transfer-data)) ERR_TRANSFER_NOT_FOUND)
+                (asserts! (>= (stx-get-balance tx-sender) (+ (get transfer-amount transfer-data) (get transfer-fee transfer-data))) ERR_INSUFFICIENT_FUNDS)
+                (try! (stx-transfer? (get transfer-amount transfer-data) tx-sender from-party))
+                (if (> (get transfer-fee transfer-data) u0)
+                    (try! (stx-transfer? (get transfer-fee transfer-data) tx-sender CONTRACT_OWNER))
+                    true)
+                (map-set loan-transfers transfer-key
+                    (merge transfer-data {approved: true}))
+                (ok true))
+            ERR_TRANSFER_NOT_FOUND)))
+
+(define-public (execute-loan-transfer (loan-id uint) (from-party principal) (to-party principal))
+    (let ((transfer-key {loan-id: loan-id, from-party: from-party, to-party: to-party}))
+        (match (map-get? loan-transfers transfer-key)
+            transfer-data
+            (begin
+                (asserts! (get approved transfer-data) ERR_TRANSFER_NOT_FOUND)
+                (asserts! (< stacks-block-height (get expires-at transfer-data)) ERR_TRANSFER_NOT_FOUND)
+                (match (map-get? loans loan-id)
+                    loan-data
+                    (begin
+                        (asserts! (is-eq (some from-party) (get cosigner loan-data)) ERR_UNAUTHORIZED)
+                        (map-set loans loan-id
+                            (merge loan-data {cosigner: (some to-party)}))
+                        (let ((current-from-stats (get-user-stats from-party))
+                              (current-to-stats (get-user-stats to-party)))
+                            (map-set user-stats from-party
+                                (merge current-from-stats {
+                                    loans-cosigned: (if (> (get loans-cosigned current-from-stats) u0)
+                                                      (- (get loans-cosigned current-from-stats) u1)
+                                                      u0),
+                                    total-cosigned: (if (>= (get total-cosigned current-from-stats) (get amount loan-data))
+                                                      (- (get total-cosigned current-from-stats) (get amount loan-data))
+                                                      u0)
+                                }))
+                            (map-set user-stats to-party
+                                (merge current-to-stats {
+                                    loans-cosigned: (+ (get loans-cosigned current-to-stats) u1),
+                                    total-cosigned: (+ (get total-cosigned current-to-stats) (get amount loan-data))
+                                })))
+                        (map-delete loan-transfers transfer-key)
+                        (ok true))
+                    ERR_LOAN_NOT_FOUND))
+            ERR_TRANSFER_NOT_FOUND)))
+
+(define-public (cancel-loan-transfer (loan-id uint) (to-party principal))
+    (let ((transfer-key {loan-id: loan-id, from-party: tx-sender, to-party: to-party}))
+        (match (map-get? loan-transfers transfer-key)
+            transfer-data
+            (begin
+                (asserts! (not (get approved transfer-data)) ERR_TRANSFER_ALREADY_APPROVED)
+                (map-delete loan-transfers transfer-key)
+                (ok true))
+            ERR_TRANSFER_NOT_FOUND)))
 
 (define-read-only (get-contract-balance)
     (stx-get-balance (as-contract tx-sender)))

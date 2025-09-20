@@ -25,6 +25,11 @@
 (define-constant ERR_TRANSFER_TO_SELF (err u123))
 (define-constant ERR_TRANSFER_ALREADY_APPROVED (err u124))
 (define-constant ERR_INVALID_TRANSFER_AMOUNT (err u125))
+(define-constant ERR_INVALID_RATING_TYPE (err u126))
+(define-constant ERR_RATING_UPDATE_FAILED (err u127))
+(define-constant ERR_AUTOPAY_ALREADY_ENABLED (err u128))
+(define-constant ERR_AUTOPAY_NOT_ENABLED (err u129))
+(define-constant ERR_AUTOPAY_EXECUTION_FAILED (err u130))
 
 (define-data-var loan-counter uint u0)
 
@@ -92,6 +97,35 @@
     expires-at: uint
 })
 
+(define-map user-ratings principal {
+    credit-score: uint,
+    payment-reliability: uint,
+    default-rate: uint,
+    total-volume: uint,
+    last-updated: uint,
+    rating-tier: (string-ascii 10)
+})
+
+(define-map loan-ratings uint {
+    risk-score: uint,
+    expected-return: uint,
+    borrower-rating: uint,
+    cosigner-rating: uint,
+    collateral-score: uint,
+    final-rating: (string-ascii 10)
+})
+
+(define-map loan-autopay uint {
+    enabled: bool,
+    payment-amount: uint,
+    frequency-blocks: uint,
+    next-execution: uint,
+    max-attempts: uint,
+    current-attempts: uint,
+    grace-period-blocks: uint,
+    last-execution: (optional uint)
+})
+
 (define-read-only (get-loan (loan-id uint))
     (map-get? loans loan-id))
 
@@ -116,6 +150,9 @@
 
 (define-read-only (get-loan-transfer (loan-id uint) (from-party principal) (to-party principal))
     (map-get? loan-transfers {loan-id: loan-id, from-party: from-party, to-party: to-party}))
+
+(define-read-only (get-loan-autopay (loan-id uint))
+    (map-get? loan-autopay loan-id))
 
 (define-read-only (calculate-collateral-ratio (loan-id uint))
     (match (map-get? loans loan-id)
@@ -147,6 +184,13 @@
                                            (map-get? loan-payments loan-id))))
                 (> stacks-block-height (get next-payment-due payment-info)))
             false)
+        false))
+
+(define-read-only (is-autopay-due (loan-id uint))
+    (match (map-get? loan-autopay loan-id)
+        autopay-data
+        (and (get enabled autopay-data)
+             (>= stacks-block-height (get next-execution autopay-data)))
         false))
 
 (define-private (update-user-stats (user principal) (field (string-ascii 20)) (amount uint))
@@ -191,6 +235,119 @@
             expires-at: (+ stacks-block-height u1008)
         })
         (ok loan-id)))
+
+(define-public (enable-autopay (loan-id uint) (payment-amount uint) (frequency-blocks uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (asserts! (is-eq (get status loan-data) "active") ERR_LOAN_NOT_ACTIVE)
+            (asserts! (> payment-amount u0) ERR_INVALID_AMOUNT)
+            (asserts! (and (>= frequency-blocks u144) (<= frequency-blocks u1008)) ERR_INVALID_DURATION)
+            (asserts! (is-none (map-get? loan-autopay loan-id)) ERR_AUTOPAY_ALREADY_ENABLED)
+            (map-set loan-autopay loan-id {
+                enabled: true,
+                payment-amount: payment-amount,
+                frequency-blocks: frequency-blocks,
+                next-execution: (+ stacks-block-height frequency-blocks),
+                max-attempts: u3,
+                current-attempts: u0,
+                grace-period-blocks: u144,
+                last-execution: none
+            })
+            (ok true))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (disable-autopay (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (match (map-get? loan-autopay loan-id)
+                autopay-data
+                (begin
+                    (map-set loan-autopay loan-id
+                        (merge autopay-data {enabled: false}))
+                    (ok true))
+                ERR_AUTOPAY_NOT_ENABLED))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (execute-autopay (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (match (map-get? loan-autopay loan-id)
+            autopay-data
+            (begin
+                (asserts! (get enabled autopay-data) ERR_AUTOPAY_NOT_ENABLED)
+                (asserts! (>= stacks-block-height (get next-execution autopay-data)) ERR_PAYMENT_TOO_EARLY)
+                (asserts! (is-eq (get status loan-data) "active") ERR_LOAN_NOT_ACTIVE)
+                (let ((borrower-balance (stx-get-balance (get borrower loan-data)))
+                      (payment-amount (get payment-amount autopay-data)))
+                    (if (>= borrower-balance payment-amount)
+                        (begin
+                            (try! (stx-transfer? payment-amount (get borrower loan-data) (as-contract tx-sender)))
+                            (let ((new-total-paid (+ (get repaid-amount loan-data) payment-amount))
+                                  (total-amount-due (+ (get amount loan-data) 
+                                                     (/ (* (get amount loan-data) (get interest-rate loan-data)) u100))))
+                                (map-set loans loan-id
+                                    (merge loan-data {
+                                        repaid-amount: new-total-paid,
+                                        status: (if (>= new-total-paid total-amount-due) "completed" "active"),
+                                        last-payment: (some stacks-block-height)
+                                    }))
+                                (let ((payment-info (default-to {total-paid: u0, payments-made: u0, next-payment-due: u0}
+                                                               (map-get? loan-payments loan-id))))
+                                    (map-set loan-payments loan-id {
+                                        total-paid: new-total-paid,
+                                        payments-made: (+ (get payments-made payment-info) u1),
+                                        next-payment-due: (+ stacks-block-height u1008)
+                                    }))
+                                (map-set loan-autopay loan-id
+                                    (merge autopay-data {
+                                        next-execution: (+ stacks-block-height (get frequency-blocks autopay-data)),
+                                        current-attempts: u0,
+                                        last-execution: (some stacks-block-height)
+                                    }))
+                                (ok true)))
+                        (let ((new-attempts (+ (get current-attempts autopay-data) u1)))
+                            (if (>= new-attempts (get max-attempts autopay-data))
+                                (begin
+                                    (map-set loan-autopay loan-id
+                                        (merge autopay-data {
+                                            enabled: false,
+                                            current-attempts: new-attempts
+                                        }))
+                                    ERR_AUTOPAY_EXECUTION_FAILED)
+                                (begin
+                                    (map-set loan-autopay loan-id
+                                        (merge autopay-data {
+                                            next-execution: (+ stacks-block-height (get grace-period-blocks autopay-data)),
+                                            current-attempts: new-attempts
+                                        }))
+                                    ERR_INSUFFICIENT_FUNDS))))))
+            ERR_AUTOPAY_NOT_ENABLED)
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (update-autopay-settings (loan-id uint) (payment-amount uint) (frequency-blocks uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+            (match (map-get? loan-autopay loan-id)
+                autopay-data
+                (begin
+                    (asserts! (> payment-amount u0) ERR_INVALID_AMOUNT)
+                    (asserts! (and (>= frequency-blocks u144) (<= frequency-blocks u1008)) ERR_INVALID_DURATION)
+                    (map-set loan-autopay loan-id
+                        (merge autopay-data {
+                            payment-amount: payment-amount,
+                            frequency-blocks: frequency-blocks,
+                            next-execution: (+ stacks-block-height frequency-blocks)
+                        }))
+                    (ok true))
+                ERR_AUTOPAY_NOT_ENABLED))
+        ERR_LOAN_NOT_FOUND))
+
 
 (define-public (request-cosigner (loan-id uint) (cosigner principal))
     (match (map-get? loans loan-id)
@@ -275,6 +432,7 @@
                 (ok true)))
         ERR_LOAN_NOT_FOUND))
 
+
 (define-public (declare-default (loan-id uint))
     (match (map-get? loans loan-id)
         loan-data
@@ -289,8 +447,12 @@
             (match (get cosigner loan-data)
                 cosigner-principal (update-user-stats cosigner-principal "defaults" u0)
                 true)
+            (match (map-get? loan-autopay loan-id)
+                autopay-data (map-set loan-autopay loan-id (merge autopay-data {enabled: false}))
+                true)
             (ok true))
         ERR_LOAN_NOT_FOUND))
+
 
 (define-public (deposit-collateral (loan-id uint) (collateral-amount uint))
     (match (map-get? loans loan-id)
@@ -538,14 +700,17 @@
         loan-data
         (let ((payment-info (map-get? loan-payments loan-id))
               (collateral-info (map-get? loan-collateral loan-id))
+              (autopay-info (map-get? loan-autopay loan-id))
               (total-due (+ (get amount loan-data) 
                            (/ (* (get amount loan-data) (get interest-rate loan-data)) u100))))
             (ok {
                 loan: loan-data,
                 payment-info: payment-info,
                 collateral-info: collateral-info,
+                autopay-info: autopay-info,
                 total-due: total-due,
                 remaining-balance: (- total-due (get repaid-amount loan-data)),
-                is-overdue: (is-loan-overdue loan-id)
+                is-overdue: (is-loan-overdue loan-id),
+                is-autopay-due: (is-autopay-due loan-id)
             }))
         ERR_LOAN_NOT_FOUND))

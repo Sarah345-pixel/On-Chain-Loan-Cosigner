@@ -30,8 +30,14 @@
 (define-constant ERR_AUTOPAY_ALREADY_ENABLED (err u128))
 (define-constant ERR_AUTOPAY_NOT_ENABLED (err u129))
 (define-constant ERR_AUTOPAY_EXECUTION_FAILED (err u130))
+(define-constant ERR_REFINANCE_NOT_FOUND (err u131))
+(define-constant ERR_REFINANCE_ALREADY_EXISTS (err u132))
+(define-constant ERR_REFINANCE_EXPIRED (err u133))
+(define-constant ERR_REFINANCE_NOT_ELIGIBLE (err u134))
+(define-constant ERR_WORSE_TERMS (err u135))
 
 (define-data-var loan-counter uint u0)
+(define-data-var refinance-counter uint u0)
 
 (define-map loans uint {
     borrower: principal,
@@ -124,6 +130,19 @@
     current-attempts: uint,
     grace-period-blocks: uint,
     last-execution: (optional uint)
+})
+
+(define-map loan-refinancing uint {
+    original-loan-id: uint,
+    new-interest-rate: uint,
+    new-duration-blocks: uint,
+    remaining-balance: uint,
+    proposed-by: principal,
+    proposed-at: uint,
+    expires-at: uint,
+    status: (string-ascii 20),
+    savings-amount: uint,
+    new-cosigner: (optional principal)
 })
 
 (define-read-only (get-loan (loan-id uint))
@@ -714,3 +733,133 @@
                 is-autopay-due: (is-autopay-due loan-id)
             }))
         ERR_LOAN_NOT_FOUND))
+
+(define-read-only (get-refinance-offer (refinance-id uint))
+    (map-get? loan-refinancing refinance-id))
+
+(define-read-only (calculate-refinance-savings (original-loan-id uint) (new-interest-rate uint))
+    (match (map-get? loans original-loan-id)
+        loan-data
+        (let ((total-due (+ (get amount loan-data) 
+                           (/ (* (get amount loan-data) (get interest-rate loan-data)) u100)))
+              (remaining-balance (- total-due (get repaid-amount loan-data)))
+              (original-interest (/ (* remaining-balance (get interest-rate loan-data)) u100))
+              (new-interest (/ (* remaining-balance new-interest-rate) u100)))
+            (ok (if (> original-interest new-interest)
+                   (- original-interest new-interest)
+                   u0)))
+        ERR_LOAN_NOT_FOUND))
+
+(define-read-only (is-refinance-eligible (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (let ((payment-info (default-to {total-paid: u0, payments-made: u0, next-payment-due: u0}
+                                       (map-get? loan-payments loan-id))))
+            (and (is-eq (get status loan-data) "active")
+                 (>= (get payments-made payment-info) u3)
+                 (not (is-loan-overdue loan-id))
+                 (> (get repaid-amount loan-data) u0)))
+        false))
+
+(define-public (propose-refinance (loan-id uint) (new-interest-rate uint) (new-duration-blocks uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (begin
+            (asserts! (is-eq (some tx-sender) (get cosigner loan-data)) ERR_UNAUTHORIZED)
+            (asserts! (is-refinance-eligible loan-id) ERR_REFINANCE_NOT_ELIGIBLE)
+            (asserts! (< new-interest-rate (get interest-rate loan-data)) ERR_WORSE_TERMS)
+            (asserts! (<= new-interest-rate u50) ERR_INVALID_INTEREST)
+            (asserts! (and (>= new-duration-blocks u1008) (<= new-duration-blocks u52560)) ERR_INVALID_DURATION)
+            (let ((refinance-id (+ (var-get refinance-counter) u1))
+                  (total-due (+ (get amount loan-data) 
+                               (/ (* (get amount loan-data) (get interest-rate loan-data)) u100)))
+                  (remaining-balance (- total-due (get repaid-amount loan-data)))
+                  (savings (unwrap! (calculate-refinance-savings loan-id new-interest-rate) ERR_LOAN_NOT_FOUND)))
+                (map-set loan-refinancing refinance-id {
+                    original-loan-id: loan-id,
+                    new-interest-rate: new-interest-rate,
+                    new-duration-blocks: new-duration-blocks,
+                    remaining-balance: remaining-balance,
+                    proposed-by: tx-sender,
+                    proposed-at: stacks-block-height,
+                    expires-at: (+ stacks-block-height u1008),
+                    status: "pending",
+                    savings-amount: savings,
+                    new-cosigner: (some tx-sender)
+                })
+                (var-set refinance-counter refinance-id)
+                (ok refinance-id)))
+        ERR_LOAN_NOT_FOUND))
+
+(define-public (accept-refinance (refinance-id uint))
+    (match (map-get? loan-refinancing refinance-id)
+        refinance-data
+        (let ((loan-id (get original-loan-id refinance-data)))
+            (match (map-get? loans loan-id)
+                loan-data
+                (begin
+                    (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+                    (asserts! (is-eq (get status refinance-data) "pending") ERR_REFINANCE_EXPIRED)
+                    (asserts! (< stacks-block-height (get expires-at refinance-data)) ERR_REFINANCE_EXPIRED)
+                    (asserts! (is-eq (get status loan-data) "active") ERR_LOAN_NOT_ACTIVE)
+                    (let ((payment-info (default-to {total-paid: u0, payments-made: u0, next-payment-due: u0}
+                                                   (map-get? loan-payments loan-id)))
+                          (old-cosigner (get cosigner loan-data))
+                          (new-cosigner (get new-cosigner refinance-data)))
+                        (map-set loans loan-id
+                            (merge loan-data {
+                                interest-rate: (get new-interest-rate refinance-data),
+                                duration-blocks: (get new-duration-blocks refinance-data),
+                                cosigner: new-cosigner,
+                                amount: (get remaining-balance refinance-data)
+                            }))
+                        (map-set loan-payments loan-id
+                            (merge payment-info {
+                                total-paid: u0,
+                                payments-made: u0,
+                                next-payment-due: (+ stacks-block-height u1008)
+                            }))
+                        (map-set loan-refinancing refinance-id
+                            (merge refinance-data {status: "accepted"}))
+                        (match old-cosigner
+                            old-principal
+                            (let ((old-stats (get-user-stats old-principal)))
+                                (map-set user-stats old-principal
+                                    (merge old-stats {
+                                        loans-cosigned: (if (> (get loans-cosigned old-stats) u0)
+                                                          (- (get loans-cosigned old-stats) u1)
+                                                          u0)
+                                    })))
+                            true)
+                        (ok true)))
+                ERR_LOAN_NOT_FOUND))
+        ERR_REFINANCE_NOT_FOUND))
+
+(define-public (reject-refinance (refinance-id uint))
+    (match (map-get? loan-refinancing refinance-id)
+        refinance-data
+        (let ((loan-id (get original-loan-id refinance-data)))
+            (match (map-get? loans loan-id)
+                loan-data
+                (begin
+                    (asserts! (is-eq (get borrower loan-data) tx-sender) ERR_UNAUTHORIZED)
+                    (asserts! (is-eq (get status refinance-data) "pending") ERR_REFINANCE_EXPIRED)
+                    (map-set loan-refinancing refinance-id
+                        (merge refinance-data {status: "rejected"}))
+                    (ok true))
+                ERR_LOAN_NOT_FOUND))
+        ERR_REFINANCE_NOT_FOUND))
+
+(define-public (cancel-refinance (refinance-id uint))
+    (match (map-get? loan-refinancing refinance-id)
+        refinance-data
+        (begin
+            (asserts! (is-eq (get proposed-by refinance-data) tx-sender) ERR_UNAUTHORIZED)
+            (asserts! (is-eq (get status refinance-data) "pending") ERR_REFINANCE_EXPIRED)
+            (map-set loan-refinancing refinance-id
+                (merge refinance-data {status: "cancelled"}))
+            (ok true))
+        ERR_REFINANCE_NOT_FOUND))
+
+(define-read-only (get-total-refinances)
+    (var-get refinance-counter))

@@ -35,6 +35,7 @@
 (define-constant ERR_REFINANCE_EXPIRED (err u133))
 (define-constant ERR_REFINANCE_NOT_ELIGIBLE (err u134))
 (define-constant ERR_WORSE_TERMS (err u135))
+(define-constant ERR_NO_FUNDS_TO_CLAIM (err u136))
 
 (define-data-var loan-counter uint u0)
 (define-data-var refinance-counter uint u0)
@@ -144,6 +145,8 @@
     savings-amount: uint,
     new-cosigner: (optional principal)
 })
+
+(define-map repayment-claims uint uint)
 
 (define-read-only (get-loan (loan-id uint))
     (map-get? loans loan-id))
@@ -863,3 +866,20 @@
 
 (define-read-only (get-total-refinances)
     (var-get refinance-counter))
+
+(define-public (claim-loan-payment (loan-id uint))
+    (match (map-get? loans loan-id)
+        loan-data
+        (match (get cosigner loan-data)
+            lender
+            (begin
+                (asserts! (is-eq tx-sender lender) ERR_UNAUTHORIZED)
+                (let ((repaid (get repaid-amount loan-data))
+                      (claimed (default-to u0 (map-get? repayment-claims loan-id)))
+                      (claimable (- repaid claimed)))
+                    (asserts! (> claimable u0) ERR_NO_FUNDS_TO_CLAIM)
+                    (try! (as-contract (stx-transfer? claimable tx-sender lender)))
+                    (map-set repayment-claims loan-id repaid)
+                    (ok claimable)))
+            ERR_NOT_COSIGNER)
+        ERR_LOAN_NOT_FOUND))
